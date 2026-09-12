@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 BUY_QTY = 1
 BUY_PROOF = 2
 ADD_CATEGORY, ADD_NAME, ADD_DESC, ADD_PRICE, ADD_STOCK, ADD_FILE = range(10, 16)
+EDIT_FIELD, EDIT_VALUE = range(20, 22)
 
 
 def is_admin(user_id: int) -> bool:
@@ -464,6 +465,102 @@ async def addproduct_skip_file(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+async def editproduct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Admins only.")
+        return ConversationHandler.END
+    products = db.list_products(active_only=False)
+    if not products:
+        await update.message.reply_text("No products yet. Use /addproduct first.")
+        return ConversationHandler.END
+    kb = [
+        [InlineKeyboardButton(f"#{p['id']} {p['name']}", callback_data=f"edit_pick:{p['id']}")]
+        for p in products
+    ]
+    await update.message.reply_text("Which product do you want to edit?", reply_markup=InlineKeyboardMarkup(kb))
+    return EDIT_FIELD
+
+
+async def editproduct_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split(":", 1)[1])
+    p = db.get_product(product_id)
+    if not p:
+        await query.edit_message_text("Product not found.")
+        return ConversationHandler.END
+    context.user_data["edit_product_id"] = product_id
+    stock = "unlimited" if p["stock"] is None else p["stock"]
+    kb = [
+        [InlineKeyboardButton(f"Name ({p['name']})", callback_data="edit_field:name")],
+        [InlineKeyboardButton(f"Description", callback_data="edit_field:description")],
+        [InlineKeyboardButton(f"Price ({p['price']:.2f})", callback_data="edit_field:price")],
+        [InlineKeyboardButton(f"Stock ({stock})", callback_data="edit_field:stock")],
+        [InlineKeyboardButton(
+            "Deactivate" if p["active"] else "Activate", callback_data="edit_field:toggle_active"
+        )],
+    ]
+    await query.edit_message_text(
+        f"Editing #{p['id']} {p['name']}. What do you want to change?",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return EDIT_FIELD
+
+
+async def editproduct_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(":", 1)[1]
+    product_id = context.user_data["edit_product_id"]
+
+    if field == "toggle_active":
+        p = db.get_product(product_id)
+        db.set_product_active(product_id, not p["active"])
+        await query.edit_message_text(
+            f"Product #{product_id} is now {'active' if not p['active'] else 'inactive'}."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    context.user_data["edit_field"] = field
+    prompts = {
+        "name": "Send the new name:",
+        "description": "Send the new description:",
+        "price": f"Send the new price in {config.CURRENCY} (e.g. 4.99):",
+        "stock": "Send the new stock quantity (a number), or 'unlimited':",
+    }
+    await query.edit_message_text(prompts[field] + "\nSend /cancel to abort.")
+    return EDIT_VALUE
+
+
+async def editproduct_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    field = context.user_data["edit_field"]
+    product_id = context.user_data["edit_product_id"]
+    text = update.message.text.strip()
+
+    if field == "price":
+        try:
+            value = float(text)
+        except ValueError:
+            await update.message.reply_text("Please send a number, e.g. 4.99")
+            return EDIT_VALUE
+    elif field == "stock":
+        if text.lower() == "unlimited":
+            value = None
+        elif text.isdigit():
+            value = int(text)
+        else:
+            await update.message.reply_text("Send a whole number, or 'unlimited'.")
+            return EDIT_VALUE
+    else:
+        value = text
+
+    db.update_product_field(product_id, field, value)
+    await update.message.reply_text(f"✅ Updated. Product #{product_id} {field} = {value}")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
 async def generic_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled.")
@@ -566,6 +663,20 @@ def main():
         name="addproduct_conversation",
     )
     app.add_handler(addproduct_conv)
+
+    editproduct_conv = ConversationHandler(
+        entry_points=[CommandHandler("editproduct", editproduct_start)],
+        states={
+            EDIT_FIELD: [
+                CallbackQueryHandler(editproduct_pick, pattern=r"^edit_pick:"),
+                CallbackQueryHandler(editproduct_field, pattern=r"^edit_field:"),
+            ],
+            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, editproduct_value)],
+        },
+        fallbacks=[CommandHandler("cancel", generic_cancel)],
+        name="editproduct_conversation",
+    )
+    app.add_handler(editproduct_conv)
 
     logger.info("Bot starting (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
