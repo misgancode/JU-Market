@@ -132,6 +132,13 @@ def set_product_active(product_id, active: bool):
         )
 
 
+def update_product_field(product_id, field, value):
+    """field must be one of: name, description, price, stock"""
+    assert field in ("name", "description", "price", "stock")
+    with get_conn() as conn:
+        conn.execute(f"UPDATE products SET {field} = ? WHERE id = ?", (value, product_id))
+
+
 def decrement_stock(product_id, qty=1):
     with get_conn() as conn:
         conn.execute(
